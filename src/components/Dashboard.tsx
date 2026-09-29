@@ -1,296 +1,167 @@
 "use client";
 
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import GoalEditor from "@/components/GoalEditor";
+import ScheduleEditor from "@/components/ScheduleEditor";
+import WeekTemplateEditor from "@/components/WeekTemplateEditor";
 import {
-  addDays,
-  blockTime,
-  dateLabel,
-  formatCountdown,
-  localDate,
-  newSchedule,
-  readSchedules,
-  scheduleStats,
-  STORAGE_KEY,
-  timeNow,
-  timeToMinutes,
-  type BlockStatus,
-  type DailySchedule,
-  type ScheduleStore,
-  type TimeBlock,
-  type TopTask,
+  addDays, dateLabel, defaultWeekTemplate, emptyPrimaryGoal, GOAL_KEY, localDate,
+  readPrimaryGoal, readSchedules, readWeekTemplate, scheduleFromTemplate, STORAGE_KEY,
+  TEMPLATE_KEY, timeNow, timeToMinutes, weekdayForDate, weekStart,
+  type DailySchedule, type PrimaryGoal, type ScheduleStore, type TimeBlock, type WeekTemplate,
 } from "@/lib/schedule";
 
-const id = () => crypto.randomUUID();
 const subscribeHydration = () => () => {};
 const getClientSnapshot = () => true;
 const getServerSnapshot = () => false;
+const dayShort = (date: string) => `${Number(date.slice(5, 7))}/${Number(date.slice(8, 10))}`;
+const weekdayShort = (date: string) => ["日", "月", "火", "水", "木", "金", "土"][weekdayForDate(date)];
 
-function blankBlock(startTime = "09:00"): TimeBlock {
-  const endMinutes = Math.min(timeToMinutes(startTime) + 60, 23 * 60 + 59);
-  return {
-    id: id(),
-    startTime,
-    endTime: `${String(Math.floor(endMinutes / 60)).padStart(2, "0")}:${String(endMinutes % 60).padStart(2, "0")}`,
-    category: "",
-    task: "",
-    completionCondition: "",
-    status: "pending",
-    actualStart: "",
-    actualEnd: "",
-    runState: "idle",
-  };
+function duration(start: string, end: string) {
+  if (!start || !end) return start ? "進行中" : "";
+  const minutes = Math.max(0, timeToMinutes(end) - timeToMinutes(start));
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return hours ? `${hours}h${rest ? `${String(rest).padStart(2, "0")}m` : ""}` : `${rest}m`;
 }
 
-function copySchedule(schedule: DailySchedule): DailySchedule {
-  return {
-    ...schedule,
-    topThree: schedule.topThree.map((task) => ({ ...task })),
-    timeBlocks: schedule.timeBlocks.map((block) => ({ ...block })),
-  };
+function PriorityCard({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+  return <section className="df-priority" aria-labelledby="priority-title">
+    <div className="df-section-kicker"><span>01</span> TODAY&apos;S PRIORITY</div>
+    <div className="df-priority-body"><div><h2 id="priority-title">今日、一番前に進めること</h2><p>ひとつに絞って、ここから始める。</p></div><input aria-label="今日の最優先事項" type="text" maxLength={140} placeholder="今日の最優先事項を1つ入力" value={value} onChange={(event) => onChange(event.target.value)} /></div>
+  </section>;
 }
 
-function Pill({ children, tone = "neutral" }: { children: React.ReactNode; tone?: "neutral" | "green" | "red" | "amber" }) {
-  return <span className={`pill pill-${tone}`}>{children}</span>;
+function ActualRecord({ block, onChange, allowNow }: { block: TimeBlock; onChange: (change: Partial<TimeBlock>) => void; allowNow: boolean }) {
+  const [editing, setEditing] = useState(false);
+  const recordedTask = block.actualTask ?? (block.status === "completed" ? block.task : "");
+  return <div className="df-actual-record">{!editing ? <div className="df-actual-preview"><div><strong>{recordedTask || "未記録"}</strong>{duration(block.actualStart, block.actualEnd) && <span>{duration(block.actualStart, block.actualEnd)}</span>}</div><button type="button" onClick={() => setEditing(true)}>{recordedTask || block.actualStart ? "編集" : "実績を記録"} ↗</button></div> : <>
+    <div className="df-actual-main"><input aria-label={`${block.startTime}の実績内容`} type="text" maxLength={140} placeholder="実際にしたこと" value={recordedTask} onChange={(event) => onChange({ actualTask: event.target.value })} /><span className="df-duration">{duration(block.actualStart, block.actualEnd) || "時間未記録"}</span></div>
+    <div className="df-actual-controls"><label>開始<input aria-label={`${block.startTime}の実際の開始`} type="time" value={block.actualStart || ""} onChange={(event) => onChange({ actualStart: event.target.value })} /></label><label>終了<input aria-label={`${block.startTime}の実際の終了`} type="time" value={block.actualEnd || ""} onChange={(event) => onChange({ actualEnd: event.target.value })} /></label>
+      {allowNow && !block.actualStart && <button type="button" onClick={() => onChange({ actualStart: timeNow() })}>今から開始</button>}
+      {allowNow && block.actualStart && !block.actualEnd && <button type="button" onClick={() => onChange({ actualEnd: timeNow() })}>今終了</button>}
+      <button type="button" onClick={() => setEditing(false)}>閉じる</button>
+    </div></>}
+  </div>;
 }
 
-function ScheduleEditor({ initial, onSave, onClose }: {
-  initial: DailySchedule;
-  onSave: (schedule: DailySchedule) => void;
-  onClose: () => void;
+function Timetable({ blocks, editable, onChange, allowNow = false }: {
+  blocks: TimeBlock[];
+  editable: boolean;
+  onChange?: (blockId: string, change: Partial<TimeBlock>) => void;
+  allowNow?: boolean;
 }) {
-  const [draft, setDraft] = useState<DailySchedule>(() => copySchedule(initial));
-  const [error, setError] = useState("");
+  if (!blocks.length) return <div className="df-empty">時間枠がありません。「予定を立てる」でこの曜日の固定枠を設定してください。</div>;
+  return <div className="df-table-wrap"><table className="df-table"><thead><tr><th>時間</th><th>予定</th><th>実績</th></tr></thead><tbody>{blocks.map((block) => <tr key={block.id} className={block.kind === "break" ? "df-break" : ""}>
+    <td data-label="時間"><strong>{block.startTime}–{block.endTime}</strong><small>{block.slotLabel || "臨時枠"}</small></td>
+    <td data-label="予定"><span className="df-plan-category">{block.kind === "break" ? "休憩" : block.category || "予定"}</span><strong>{block.kind === "break" ? block.slotLabel || "休憩" : block.task || "未設定"}</strong>{block.kind !== "break" && block.completionCondition && <small>完了条件：{block.completionCondition}</small>}</td>
+    <td data-label="実績">{editable && onChange ? <ActualRecord block={block} allowNow={allowNow} onChange={(change) => onChange(block.id, change)} /> : <div className="df-readonly-actual"><strong>{block.actualTask || (block.status === "completed" ? block.task : "未記録")}</strong>{duration(block.actualStart, block.actualEnd) && <small>{duration(block.actualStart, block.actualEnd)}</small>}</div>}</td>
+  </tr>)}</tbody></table></div>;
+}
 
-  function updateBlock(blockId: string, field: keyof TimeBlock, value: string) {
-    setDraft((current) => ({
-      ...current,
-      timeBlocks: current.timeBlocks.map((block) => block.id === blockId ? { ...block, [field]: value } : block),
-    }));
+function WeeklyProgress({ goal, week, onWeekChange, onGoalChange, onEdit }: {
+  goal: PrimaryGoal;
+  week: string;
+  onWeekChange: (week: string) => void;
+  onGoalChange: (goal: PrimaryGoal) => void;
+  onEdit: () => void;
+}) {
+  function valueAt(metricId: string, atWeek: string) {
+    const latestWeek = Object.keys(goal.weeklyValues)
+      .filter((entry) => entry <= atWeek && Object.hasOwn(goal.weeklyValues[entry], metricId))
+      .sort()
+      .at(-1);
+    return latestWeek === undefined ? undefined : goal.weeklyValues[latestWeek][metricId];
   }
-
-  function save(event: React.FormEvent) {
-    event.preventDefault();
-    const blocks = [...draft.timeBlocks].sort((a, b) => a.startTime.localeCompare(b.startTime));
-    if (timeToMinutes(draft.workStartTime) >= timeToMinutes(draft.workEndTime)) {
-      setError("作業終了は作業開始より後の時刻にしてください。");
-      return;
-    }
-    if (blocks.some((block) => !block.category.trim() || !block.task.trim() || !block.completionCondition.trim())) {
-      setError("各ブロックの分野・やること・完了条件を入力してください。");
-      return;
-    }
-    if (blocks.some((block) => timeToMinutes(block.startTime) >= timeToMinutes(block.endTime))) {
-      setError("各ブロックの終了時刻は開始時刻より後にしてください。");
-      return;
-    }
-    if (blocks.some((block, index) => index > 0 && timeToMinutes(block.startTime) < timeToMinutes(blocks[index - 1].endTime))) {
-      setError("時間ブロックが重なっています。時刻を調整してください。");
-      return;
-    }
-    onSave({
-      ...draft,
-      topThree: draft.topThree.filter((task) => task.text.trim()).map((task) => ({ ...task, text: task.text.trim() })),
-      timeBlocks: blocks.map((block) => ({
-        ...block,
-        category: block.category.trim(),
-        task: block.task.trim(),
-        completionCondition: block.completionCondition.trim(),
-      })),
-    });
+  function changeValue(metricId: string, raw: string) {
+    const previous = goal.weeklyValues[week] ?? {};
+    const next = { ...previous };
+    if (raw === "") delete next[metricId];
+    else next[metricId] = Number(raw);
+    onGoalChange({ ...goal, weeklyValues: { ...goal.weeklyValues, [week]: next } });
   }
-
-  return (
-    <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-      <div className="editor" role="dialog" aria-modal="true" aria-labelledby="editor-title">
-        <div className="editor-header">
-          <div>
-            <span className="eyebrow">PLAN YOUR DAY</span>
-            <h2 id="editor-title">{dateLabel(draft.date)}の時間割</h2>
-          </div>
-          <button type="button" className="icon-button" onClick={onClose} aria-label="閉じる">×</button>
-        </div>
-        <form onSubmit={save}>
-          <div className="editor-scroll">
-            <section className="editor-section">
-              <h3>1日の基本時刻</h3>
-              <div className="time-input-grid">
-                <label>起床予定<input type="time" required value={draft.wakeUpTime} onChange={(event) => setDraft({ ...draft, wakeUpTime: event.target.value })} /></label>
-                <label>作業開始<input type="time" required value={draft.workStartTime} onChange={(event) => setDraft({ ...draft, workStartTime: event.target.value })} /></label>
-                <label>作業終了<input type="time" required value={draft.workEndTime} onChange={(event) => setDraft({ ...draft, workEndTime: event.target.value })} /></label>
-              </div>
-            </section>
-            <section className="editor-section">
-              <div className="section-title-row"><h3>Today&apos;s 3</h3><span className="muted">最大3件</span></div>
-              {draft.topThree.map((task, index) => (
-                <div className="top-edit-row" key={task.id}>
-                  <span className="row-number">0{index + 1}</span>
-                  <input type="text" maxLength={100} placeholder="今日必ず終えること" value={task.text} onChange={(event) => setDraft({ ...draft, topThree: draft.topThree.map((item) => item.id === task.id ? { ...item, text: event.target.value } : item) })} />
-                  <button type="button" className="subtle-icon" aria-label="項目を削除" onClick={() => setDraft({ ...draft, topThree: draft.topThree.filter((item) => item.id !== task.id) })}>×</button>
-                </div>
-              ))}
-              {draft.topThree.length < 3 && <button type="button" className="add-button" onClick={() => setDraft({ ...draft, topThree: [...draft.topThree, { id: id(), text: "", completed: false }] })}>＋ やることを追加</button>}
-            </section>
-            <section className="editor-section">
-              <div className="section-title-row"><h3>時間ブロック</h3><span className="muted">時間が重ならないように設定</span></div>
-              {draft.timeBlocks.map((block, index) => (
-                <div className="block-editor" key={block.id}>
-                  <div className="block-editor-heading"><span>BLOCK {String(index + 1).padStart(2, "0")}</span><button type="button" className="text-button danger" onClick={() => setDraft({ ...draft, timeBlocks: draft.timeBlocks.filter((item) => item.id !== block.id) })}>削除</button></div>
-                  <div className="block-editor-grid">
-                    <label>開始<input type="time" required value={block.startTime} onChange={(event) => updateBlock(block.id, "startTime", event.target.value)} /></label>
-                    <label>終了<input type="time" required value={block.endTime} onChange={(event) => updateBlock(block.id, "endTime", event.target.value)} /></label>
-                    <label>分野<input type="text" required maxLength={40} placeholder="例：研究" value={block.category} onChange={(event) => updateBlock(block.id, "category", event.target.value)} /></label>
-                    <label className="wide-field">やること<input type="text" required maxLength={120} placeholder="例：モデル実験を進める" value={block.task} onChange={(event) => updateBlock(block.id, "task", event.target.value)} /></label>
-                    <label className="wide-field">完了条件<input type="text" required maxLength={120} placeholder="例：実験を1回完走" value={block.completionCondition} onChange={(event) => updateBlock(block.id, "completionCondition", event.target.value)} /></label>
-                  </div>
-                </div>
-              ))}
-              <button type="button" className="add-button" onClick={() => {
-                const last = draft.timeBlocks.at(-1);
-                setDraft({ ...draft, timeBlocks: [...draft.timeBlocks, blankBlock(last?.endTime || draft.workStartTime)] });
-              }}>＋ 時間ブロックを追加</button>
-            </section>
-            {error && <p className="form-error" role="alert">{error}</p>}
-          </div>
-          <div className="editor-footer"><button type="button" className="secondary-button" onClick={onClose}>キャンセル</button><button type="submit" className="primary-button">時間割を保存 <span>→</span></button></div>
-        </form>
-      </div>
-    </div>
-  );
+  return <section className="df-panel df-weekly" aria-labelledby="weekly-title">
+    <div className="df-panel-heading"><div><div className="df-section-kicker"><span>03</span> WEEKLY PROGRESS</div><h2 id="weekly-title">今週、目標にどれだけ近づいたか</h2><p>主要目標の累計を、週単位で記録。</p></div><button type="button" className="df-quiet-button" onClick={onEdit}>目標を設定 ↗</button></div>
+    <div className="df-week-bar"><div><strong>{dayShort(week)}–{dayShort(addDays(week, 6))}</strong><span>{goal.period || "今週"}</span></div><div className="df-week-nav"><button type="button" aria-label="前の週" onClick={() => onWeekChange(addDays(week, -7))}>←</button><button type="button" onClick={() => onWeekChange(weekStart(localDate()))}>今週</button><button type="button" aria-label="次の週" onClick={() => onWeekChange(addDays(week, 7))}>→</button></div></div>
+    {goal.title && goal.metrics.length ? <div className="df-goal-content"><h3>{goal.title}</h3><div className="df-metrics">{goal.metrics.map((metric) => {
+      const value = valueAt(metric.id, week);
+      const previous = valueAt(metric.id, addDays(week, -7));
+      const delta = value !== undefined && previous !== undefined ? value - previous : undefined;
+      const percent = metric.target && metric.target > 0 && value !== undefined ? Math.min(100, Math.max(0, value / metric.target * 100)) : 0;
+      const recorded = goal.weeklyValues[week]?.[metric.id];
+      return <div className="df-metric" key={metric.id}><label htmlFor={`metric-${metric.id}`}>{metric.label}</label><div className="df-metric-value"><input id={`metric-${metric.id}`} type="number" min="0" step="any" placeholder={value === undefined ? "0" : String(value)} value={recorded ?? ""} onChange={(event) => changeValue(metric.id, event.target.value)} /><span>{metric.unit}</span>{metric.target !== null && <small>/ {metric.target}{metric.unit}</small>}</div>{recorded === undefined && value !== undefined && <small className="df-metric-inherited">前週までの累計 {value}{metric.unit}</small>}{delta !== undefined && <small className="df-metric-delta">前週から {delta >= 0 ? "+" : ""}{delta}{metric.unit}</small>}{metric.target !== null && metric.target > 0 && <div className="df-meter" aria-label={`${Math.round(percent)}%`}><span style={{ width: `${percent}%` }} /></div>}</div>;
+    })}</div></div> : <div className="df-empty df-goal-empty"><strong>主要目標を1つ設定する</strong><p>追いかける数値と期間の目標値を自由に決められます。</p><button type="button" className="df-solid-button" onClick={onEdit}>目標を設定 →</button></div>}
+  </section>;
 }
 
 export default function Dashboard() {
   const hydrated = useSyncExternalStore(subscribeHydration, getClientSnapshot, getServerSnapshot);
   const [schedules, setSchedules] = useState<ScheduleStore>(() => typeof window === "undefined" ? {} : readSchedules());
+  const [template, setTemplate] = useState<WeekTemplate>(() => typeof window === "undefined" ? defaultWeekTemplate() : readWeekTemplate());
+  const [goal, setGoal] = useState<PrimaryGoal>(() => typeof window === "undefined" ? emptyPrimaryGoal() : readPrimaryGoal());
   const [today, setToday] = useState(() => localDate());
   const [selectedDate, setSelectedDate] = useState(() => localDate());
-  const [clock, setClock] = useState(() => Date.now());
-  const [editing, setEditing] = useState(false);
+  const [selectedWeek, setSelectedWeek] = useState(() => weekStart(localDate()));
+  const [view, setView] = useState<"home" | "planner">("home");
+  const [editingSchedule, setEditingSchedule] = useState(false);
+  const [editingTemplate, setEditingTemplate] = useState(false);
+  const [editingGoal, setEditingGoal] = useState(false);
 
   useEffect(() => {
-    const interval = window.setInterval(() => {
-      setClock(Date.now());
-      const nextToday = localDate();
-      setToday((oldToday) => {
-        if (oldToday !== nextToday) setSelectedDate((date) => date === oldToday ? nextToday : date);
-        return nextToday;
-      });
-    }, 1000);
-    return () => window.clearInterval(interval);
+    const timer = window.setInterval(() => setToday(localDate()), 30_000);
+    return () => window.clearInterval(timer);
   }, []);
+  useEffect(() => { if (hydrated) localStorage.setItem(STORAGE_KEY, JSON.stringify(schedules)); }, [hydrated, schedules]);
+  useEffect(() => { if (hydrated) localStorage.setItem(TEMPLATE_KEY, JSON.stringify(template)); }, [hydrated, template]);
+  useEffect(() => { if (hydrated) localStorage.setItem(GOAL_KEY, JSON.stringify(goal)); }, [hydrated, goal]);
 
-  useEffect(() => {
-    if (hydrated) localStorage.setItem(STORAGE_KEY, JSON.stringify(schedules));
-  }, [schedules, hydrated]);
+  const todaySchedule = schedules[today] ?? scheduleFromTemplate(today, template);
+  const selectedSchedule = schedules[selectedDate] ?? scheduleFromTemplate(selectedDate, template);
+  const todayBlocks = useMemo(() => [...todaySchedule.timeBlocks].sort((a, b) => a.startTime.localeCompare(b.startTime)), [todaySchedule.timeBlocks]);
+  const selectedBlocks = useMemo(() => [...selectedSchedule.timeBlocks].sort((a, b) => a.startTime.localeCompare(b.startTime)), [selectedSchedule.timeBlocks]);
+  const priority = todaySchedule.priority ?? todaySchedule.topThree[0]?.text ?? "";
+  const weekDates = Array.from({ length: 7 }, (_, index) => addDays(weekStart(selectedDate), index));
 
-  const schedule = schedules[selectedDate] ?? newSchedule(selectedDate);
-  const blocks = useMemo(() => [...schedule.timeBlocks].sort((a, b) => a.startTime.localeCompare(b.startTime)), [schedule.timeBlocks]);
-  const stats = scheduleStats(schedule);
-  const isToday = selectedDate === today;
-  const isTomorrow = selectedDate === addDays(today, 1);
-  const hasPlan = !!schedules[selectedDate];
-  const dueBlocks = isToday ? blocks.filter((block) => block.status === "pending" && blockTime(selectedDate, block.endTime) <= clock) : [];
-  const nowBlock = isToday ? blocks.find((block) => block.status === "pending" && blockTime(selectedDate, block.startTime) <= clock && blockTime(selectedDate, block.endTime) > clock) : undefined;
-  const nextBlock = isToday && !nowBlock ? blocks.find((block) => block.status === "pending" && blockTime(selectedDate, block.startTime) > clock) : undefined;
-  const focusBlock = nowBlock ?? nextBlock;
-
-  function saveSchedule(next: DailySchedule) {
-    setSchedules((current) => ({ ...current, [next.date]: next }));
-    setEditing(false);
-  }
-
-  function updateBlock(blockId: string, change: Partial<TimeBlock>) {
+  function updateDay(date: string, transform: (schedule: DailySchedule) => DailySchedule) {
     setSchedules((current) => {
-      const base = current[selectedDate] ?? newSchedule(selectedDate);
-      return { ...current, [selectedDate]: { ...base, timeBlocks: base.timeBlocks.map((block) => block.id === blockId ? { ...block, ...change } : block) } };
+      const base = current[date] ?? scheduleFromTemplate(date, template);
+      return { ...current, [date]: transform(base) };
     });
   }
-
-  function setStatus(block: TimeBlock, status: BlockStatus) {
-    updateBlock(block.id, { status, actualEnd: block.actualStart ? timeNow() : block.actualEnd, runState: "idle" });
+  function updateActual(date: string, blockId: string, change: Partial<TimeBlock>) {
+    updateDay(date, (schedule) => ({ ...schedule, timeBlocks: schedule.timeBlocks.map((block) => block.id === blockId ? { ...block, ...change } : block) }));
   }
-
-  function startBlock(block: TimeBlock) {
-    updateBlock(block.id, { runState: "running", actualStart: block.actualStart || timeNow() });
-  }
-
-  function toggleTopTask(task: TopTask) {
-    setSchedules((current) => {
-      const base = current[selectedDate];
-      if (!base) return current;
-      return { ...current, [selectedDate]: { ...base, topThree: base.topThree.map((item) => item.id === task.id ? { ...item, completed: !item.completed } : item) } };
-    });
+  function saveSchedule(schedule: DailySchedule) {
+    setSchedules((current) => ({ ...current, [schedule.date]: schedule }));
+    setEditingSchedule(false);
   }
 
   if (!hydrated) return <main className="loading-screen">DAYFRAME</main>;
 
-  return (
-    <div className="app-shell">
-      <header className="site-header">
-        <div className="brand"><span className="brand-mark"><i /><i /><i /><i /></span><span>DAYFRAME</span></div>
-        <div className="header-right"><span className="header-caption">今日を、予定通りに。</span><span className="live-dot" /> <span className="header-clock">{new Date(clock).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" })}</span></div>
-      </header>
-
-      <main className="main-content">
-        <div className="page-topline"><span>PERSONAL DASHBOARD</span><span>01 / DAILY PLANNER</span></div>
-        <div className="page-heading">
-          <div><p className="eyebrow">YOUR DAY, BY DESIGN</p><h1>{isToday ? "今日の時間割" : isTomorrow ? "明日の時間割" : "時間割"}</h1><p className="date-heading">{dateLabel(selectedDate)}</p></div>
-          <div className="heading-actions"><label className="date-picker-label">日付を選ぶ<input type="date" value={selectedDate} onChange={(event) => setSelectedDate(event.target.value)} /></label><button className="primary-button" onClick={() => setEditing(true)}>{hasPlan ? "時間割を編集" : "時間割を作成"}<span>↗</span></button></div>
-        </div>
-
-        <nav className="date-tabs" aria-label="表示する日付"><button className={isToday ? "active" : ""} onClick={() => setSelectedDate(today)}>今日 <span>{today.slice(5).replace("-", "/")}</span></button><button className={isTomorrow ? "active" : ""} onClick={() => setSelectedDate(addDays(today, 1))}>明日 <span>{addDays(today, 1).slice(5).replace("-", "/")}</span></button></nav>
-
-        <section className="overview-card" aria-label="1日の概要">
-          <div className="overview-intro"><span className="eyebrow">DAILY OVERVIEW</span><strong>{isToday ? "今日の予定" : isTomorrow ? "明日の予定" : "この日の予定"}</strong><span className="muted">{blocks.length}つの時間ブロック</span></div>
-          <div className="overview-item"><span>起床</span><strong>{hasPlan ? schedule.wakeUpTime : "--:--"}</strong></div>
-          <div className="overview-item"><span>作業開始</span><strong>{hasPlan ? schedule.workStartTime : "--:--"}</strong></div>
-          <div className="overview-item"><span>作業終了</span><strong>{hasPlan ? schedule.workEndTime : "--:--"}</strong></div>
-          <div className="overview-score"><span>予定遵守率</span><strong>{blocks.length ? `${stats.adherence}%` : "—"}</strong><small>完了ブロックの割合</small></div>
+  return <div className="df-shell">
+    <header className="df-header"><div className="df-brand"><span className="df-brand-mark">▦</span> DAYFRAME</div><nav aria-label="メインナビゲーション"><button type="button" className={view === "home" ? "active" : ""} onClick={() => setView("home")}>今日</button><button type="button" className={view === "planner" ? "active" : ""} onClick={() => setView("planner")}>予定を立てる</button></nav><span className="df-header-date">{dayShort(today)}（{weekdayShort(today)}）</span></header>
+    <main className="df-main">
+      {view === "home" ? <>
+        <div className="df-page-title"><div><span className="df-overline">DAILY DASHBOARD</span><h1>今日を、予定通りに。</h1><p>{dateLabel(today)}</p></div><button type="button" className="df-quiet-button" onClick={() => { setSelectedDate(today); setView("planner"); }}>今日の予定を編集 ↗</button></div>
+        <PriorityCard value={priority} onChange={(value) => updateDay(today, (schedule) => ({ ...schedule, priority: value }))} />
+        <section className="df-panel df-timetable" aria-labelledby="timetable-title"><div className="df-panel-heading"><div><div className="df-section-kicker"><span>02</span> TIME TABLE</div><h2 id="timetable-title">時間割</h2><p>予定した時間と、実際に使った時間。</p></div><button type="button" className="df-quiet-button" onClick={() => { setSelectedDate(today); setView("planner"); }}>予定を変更 ↗</button></div><Timetable blocks={todayBlocks} editable allowNow onChange={(blockId, change) => updateActual(today, blockId, change)} /></section>
+        <WeeklyProgress goal={goal} week={selectedWeek} onWeekChange={setSelectedWeek} onGoalChange={setGoal} onEdit={() => setEditingGoal(true)} />
+      </> : <>
+        <div className="df-page-title"><div><span className="df-overline">PLAN AHEAD</span><h1>先の予定を立てる</h1><p>曜日の枠組みを使い、日ごとの内容を決める。</p></div><button type="button" className="df-quiet-button" onClick={() => setEditingTemplate(true)}>曜日の固定枠を設定 ↗</button></div>
+        <section className="df-panel df-planner" aria-label="日付と予定の選択"><div className="df-plan-toolbar"><div className="df-week-nav"><button type="button" aria-label="前の週" onClick={() => setSelectedDate(addDays(selectedDate, -7))}>←</button><strong>{dayShort(weekDates[0])}–{dayShort(weekDates[6])}</strong><button type="button" aria-label="次の週" onClick={() => setSelectedDate(addDays(selectedDate, 7))}>→</button></div><label>日付を選ぶ<input type="date" value={selectedDate} onChange={(event) => setSelectedDate(event.target.value)} /></label><button type="button" className="df-solid-button" onClick={() => setEditingSchedule(true)}>この日の予定を編集 →</button></div>
+          <div className="df-week-strip">{weekDates.map((date) => {
+            const plan = schedules[date] ?? scheduleFromTemplate(date, template);
+            const planned = plan.timeBlocks.filter((block) => block.kind !== "break" && block.task.trim()).length;
+            const firstTask = plan.timeBlocks.find((block) => block.kind !== "break" && block.task.trim())?.task;
+            return <button type="button" key={date} className={selectedDate === date ? "selected" : ""} onClick={() => setSelectedDate(date)}><span>{weekdayShort(date)}</span><strong>{Number(date.slice(8, 10))}</strong><small title={firstTask}>{firstTask || "内容未設定"}{planned > 1 ? ` ほか${planned - 1}件` : ""}</small></button>;
+          })}</div>
         </section>
-
-        {!hasPlan && <div className="empty-plan-banner"><div><strong>まだ時間割がありません</strong><span>やることと時間を決めて、1日の流れを作りましょう。</span></div><button className="outline-button" onClick={() => setEditing(true)}>時間割を作成 →</button></div>}
-
-        {dueBlocks.length > 0 && <section className="due-panel" aria-label="終了した時間ブロック"><div className="due-heading"><span className="due-icon">!</span><div><strong>終了したブロックを判定してください</strong><p>未完了でも予定は後ろへずらしません。次のブロックから戻れます。</p></div></div><div className="due-list">{dueBlocks.map((block) => <div className="due-item" key={block.id}><span>{block.endTime} 終了 · {block.task}</span><div><button onClick={() => setStatus(block, "completed")}>完了</button><button onClick={() => setStatus(block, "failed")}>未完了</button></div></div>)}</div></section>}
-
-        <div className="dashboard-grid">
-          <div className="left-column">
-            <section className="now-card" aria-label="現在の時間ブロック">
-              <div className="card-topline"><span className="eyebrow light">{nowBlock ? "● NOW" : nextBlock ? "↗ UP NEXT" : "NOW"}</span><span>{isToday ? timeNow(new Date(clock)) : "DAILY PLAN"}</span></div>
-              {focusBlock ? <>
-                <div className="now-main"><p className="now-time">{focusBlock.startTime} <span>—</span> {focusBlock.endTime}</p><span className="now-category">{focusBlock.category}</span><h2>{focusBlock.task}</h2><div className="condition"><span>完了条件</span><p>{focusBlock.completionCondition}</p></div></div>
-                {focusBlock.runState !== "idle" && <div className="timer-row"><div><span>終了予定まで</span><strong>{formatCountdown(blockTime(selectedDate, focusBlock.endTime) - clock)}</strong></div><Pill tone={focusBlock.runState === "paused" ? "amber" : "green"}>{focusBlock.runState === "paused" ? "一時停止中" : "進行中"}</Pill></div>}
-                {nowBlock && <div className="now-actions">{focusBlock.runState !== "running" ? <button className="now-start" onClick={() => startBlock(focusBlock)}>{focusBlock.runState === "paused" ? "RESUME" : "START"} <span>→</span></button> : <button className="now-pause" onClick={() => updateBlock(focusBlock.id, { runState: "paused" })}>PAUSE</button>}<button className="now-complete" onClick={() => setStatus(focusBlock, "completed")}>完了</button><button className="now-failed" onClick={() => setStatus(focusBlock, "failed")}>未完了</button></div>}
-                {nextBlock && <p className="next-note">開始時刻になると、このブロックを実行できます。</p>}
-              </> : <div className="no-now"><span className="no-now-symbol">◎</span><h2>{!isToday ? "この日の予定を確認" : blocks.length ? "現在のブロックはありません" : "時間割を作成しましょう"}</h2><p>{isToday && blocks.length ? "予定を終えたら、今日の結果を振り返りましょう。" : "時間ブロックを設定すると、ここに次の予定が表示されます。"}</p>{!blocks.length && <button onClick={() => setEditing(true)}>時間割を作成 →</button>}</div>}
-              <div className="now-footnote">予定が崩れても、次のブロックから再開。</div>
-            </section>
-
-            <section className="panel top-three-panel"><div className="panel-heading"><div><span className="eyebrow">PRIORITIES</span><h2>Today&apos;s 3</h2></div><span className="fraction">{stats.topCompleted}<span> / {stats.topTotal || 3}</span></span></div>
-              {schedule.topThree.length ? <div className="top-three-list">{schedule.topThree.map((task, index) => <label className={`top-task ${task.completed ? "done" : ""}`} key={task.id}><input type="checkbox" checked={task.completed} disabled={!isToday} onChange={() => toggleTopTask(task)} /><span className="custom-check">✓</span><span className="top-task-text">{task.text}</span><span className="task-index">0{index + 1}</span></label>)}</div> : <div className="panel-empty">今日、必ず終えたいことを最大3つ設定できます。</div>}
-              <button className="panel-link" onClick={() => setEditing(true)}>項目を編集 <span>↗</span></button>
-            </section>
-          </div>
-
-          <div className="right-column">
-            <section className="panel timetable-panel"><div className="panel-heading"><div><span className="eyebrow">YOUR SCHEDULE</span><h2>{isToday ? "今日" : isTomorrow ? "明日" : "この日"}の時間割</h2></div><span className="block-count">{blocks.length} BLOCKS</span></div>
-              {blocks.length ? <div className="timetable-list">{blocks.map((block, index) => {
-                const active = isToday && blockTime(selectedDate, block.startTime) <= clock && blockTime(selectedDate, block.endTime) > clock;
-                const ended = isToday && blockTime(selectedDate, block.endTime) <= clock;
-                return <article className={`time-row ${active ? "active" : ""} ${block.status !== "pending" ? "settled" : ""}`} key={block.id}>
-                  <div className="row-timeline"><span className="timeline-dot" /><span className="row-time">{block.startTime}</span><span className="row-end">{block.endTime}</span></div>
-                  <div className="row-content"><div className="row-category"><span>{block.category}</span>{active && block.status === "pending" && <span className="active-tag">NOW</span>}</div><h3>{block.task}</h3><p>完了条件：{block.completionCondition}</p><div className="record-row"><label>実際の開始 <input type="time" value={block.actualStart} disabled={!isToday} onChange={(event) => updateBlock(block.id, { actualStart: event.target.value })} /></label><label>実際の終了 <input type="time" value={block.actualEnd} disabled={!isToday} onChange={(event) => updateBlock(block.id, { actualEnd: event.target.value })} /></label></div></div>
-                  <div className="row-result"><Pill tone={block.status === "completed" ? "green" : block.status === "failed" ? "red" : ended ? "amber" : "neutral"}>{block.status === "completed" ? "完了" : block.status === "failed" ? "未完了" : ended ? "判定待ち" : "予定"}</Pill>{isToday && block.status === "pending" && <div className="row-actions"><button onClick={() => setStatus(block, "completed")} title="完了として記録">✓</button><button onClick={() => setStatus(block, "failed")} title="未完了として記録">×</button></div>}{isToday && block.status !== "pending" && <button className="undo-button" onClick={() => updateBlock(block.id, { status: "pending", actualEnd: "" })}>取り消す</button>}</div>
-                  <span className="row-order">{String(index + 1).padStart(2, "0")}</span>
-                </article>;
-              })}</div> : <div className="timetable-empty"><span>＋</span><strong>ブロックがありません</strong><p>集中する時間と、その完了条件を決めましょう。</p><button onClick={() => setEditing(true)}>ブロックを追加 →</button></div>}
-              {blocks.length > 0 && <div className="timetable-footer"><span>終了時刻を過ぎたブロックは判定待ちになります。</span><button onClick={() => setEditing(true)}>時間割を編集 ↗</button></div>}
-            </section>
-          </div>
-        </div>
-
-        {selectedDate <= today && <section className="result-panel"><div className="result-title"><span className="eyebrow">DAY IN REVIEW</span><h2>{isToday ? "今日" : "この日"}の振り返り</h2><p>予定通りにできたことを、シンプルに確認。</p></div><div className="result-stat"><span>時間ブロック完了</span><strong>{stats.completed}<small> / {stats.total}</small></strong></div><div className="result-stat"><span>予定通り開始 <sup>※</sup></span><strong>{stats.onTime}<small> / {stats.total}</small></strong></div><div className="result-stat"><span>Today&apos;s 3</span><strong>{stats.topCompleted}<small> / {stats.topTotal}</small></strong></div><div className="result-stat accent"><span>予定遵守率</span><strong>{blocks.length ? `${stats.adherence}%` : "—"}</strong></div><p className="result-note">※ 予定開始から5分以内に開始したブロック</p></section>}
-        <footer className="site-footer"><span>DAYFRAME</span><span>小さな計画を、今日の行動に。</span><span>データはこのブラウザに保存されます</span></footer>
-      </main>
-      {editing && <ScheduleEditor initial={schedule} onSave={saveSchedule} onClose={() => setEditing(false)} />}
-    </div>
-  );
+        <section className="df-panel df-plan-detail" aria-labelledby="plan-detail-title"><div className="df-panel-heading"><div><div className="df-section-kicker">DAY PLAN</div><h2 id="plan-detail-title">{dateLabel(selectedDate)}</h2><p>最優先：{selectedSchedule.priority ?? selectedSchedule.topThree[0]?.text ?? "未設定"}</p></div><button type="button" className="df-quiet-button" onClick={() => setEditingSchedule(true)}>内容を編集 ↗</button></div><Timetable blocks={selectedBlocks} editable={selectedDate <= today} allowNow={selectedDate === today} onChange={(blockId, change) => updateActual(selectedDate, blockId, change)} /></section>
+      </>}
+      <footer className="df-footer"><span>DAYFRAME</span><span>記録はこのブラウザに保存されます</span></footer>
+    </main>
+    {editingSchedule && <ScheduleEditor initial={selectedSchedule} onSave={saveSchedule} onClose={() => setEditingSchedule(false)} />}
+    {editingTemplate && <WeekTemplateEditor initial={template} initialDay={weekdayForDate(selectedDate)} onSave={(next) => { setTemplate(next); setEditingTemplate(false); }} onClose={() => setEditingTemplate(false)} />}
+    {editingGoal && <GoalEditor initial={goal} onSave={(next) => { setGoal(next); setEditingGoal(false); }} onClose={() => setEditingGoal(false)} />}
+  </div>;
 }
