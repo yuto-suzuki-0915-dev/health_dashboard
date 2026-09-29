@@ -1,9 +1,11 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import "./features.css";
+import "./dashboard.css";
 
 export const metadata: Metadata = {
   title: "DAYFRAME | 今日を予定通りに",
-  description: "今日の時間割を決め、実行し、振り返る個人用ダッシュボード",
+  description: "予定と実績を比べ、今日の優先事項と週の主要目標を確認するダッシュボード",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
